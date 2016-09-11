@@ -1,0 +1,26 @@
+Import/Export Changes
+
+* Attributes can be what?
+   * scalars
+      * of any supported type
+   * vectors
+      * or modeled as separate scalars?
+   * tensors
+      * ditto?
+* What if any effort should we make to be type-safe?
+   * perhaps not in existing formats, but what about a custom?
+   * doesn't seem to be a priority in this field
+* allow saving and reading attributes in files that support it
+* support separate file to save/read attributes (*.fld)
+   * multiple starting conditions
+   * checkpointing long simulations
+* How do we make sure the object files and attribute files remain in sync?
+   * How important is this in general?
+* Is there a single "official" format we want to promote?
+   * or do we want to do some kind of plugin architecture?
+      * is there enough need for this?
+* Is there a way to integrate this with other languages smoothly?
+   * PySimit? NetworkX?
+* What about hdf5 or other similar storage scheme?
+* what about other binary formats?
+* How does this interact with FieldRefs/TensorRefs?

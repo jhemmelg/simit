@@ -1,9 +1,10 @@
-build
+build*
 xcode
 doc
 *~
 debug
 release
+.DS_Store
 .*.swp
 *.ir.sim
 *.ir.ll
