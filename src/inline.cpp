@@ -7,14 +7,155 @@
 #include "temps.h"
 #include "flatten.h"
 #include "intrinsics.h"
+#include "ir_builder.h"
 #include "ir_codegen.h"
+#include "ir_queries.h"
+#include "ir_transforms.h"
 #include "grid_ops.h"
 #include "stencils.h"
+#include "rw_analysis.h"
+#include "var_replace_rewriter.h"
+#include "util/collections.h"
 
 using namespace std;
 
 namespace simit {
 namespace ir {
+
+bool CallRewriter::shouldInline(const CallStmt *op) {
+  // Check for non-element tensor arguments
+  for (auto arg : op->callee.getArguments()) {
+    if (!arg.getType().isTensor() || 
+        arg.getType().toTensor()->hasSystemDimensions()) {
+      return true;
+    }
+  }
+  
+  // Check for non-element tensor results
+  for (auto res : op->callee.getResults()) {
+    if (!res.getType().isTensor() || 
+        res.getType().toTensor()->hasSystemDimensions()) {
+      return true;
+    }
+  }
+
+  // Check for writes to inout arguments that are not variables
+  ReadWriteAnalysis rwAnalysis(op->callee.getArguments());
+  op->callee.getBody().accept(&rwAnalysis);
+  for (size_t i = 0; i < op->actuals.size(); ++i) {
+    if (!isa<VarExpr>(op->actuals[i]) && 
+        util::contains(rwAnalysis.getWrites(), op->callee.getArguments()[i])) {
+      return true;
+    }
+  }
+
+  class ReferencesSet : public IRQuery {
+    using IRQuery::visit;
+
+    void visit(const VarExpr *op) {
+      // TODO: Check for references to extern variables
+      if (op->type.isSet()) {
+        result = true;
+      }
+    }
+
+    void visit(const VarDecl *op) {
+      if (!op->var.getType().isTensor() ||
+          op->var.getType().toTensor()->hasSystemDimensions()) {
+        result = true;
+      }
+    }
+
+    void visit(const For *op) {
+      result = true;
+    }
+  };
+
+  // Check for references to sets within function body
+  return ReferencesSet().query(op->callee.getBody());
+}
+
+std::set<Var> CallRewriter::getReferencedVars(const std::vector<Expr> &exprs) {
+  class CollectVars : public IRVisitor {
+    public:
+      CollectVars(std::set<Var> &vars) : vars(vars) {}
+  
+    private:
+      using IRVisitor::visit;
+  
+      void visit(const VarExpr *op) {
+        vars.insert(op->var);
+      }
+
+      std::set<Var> &vars;
+  };
+
+  std::set<Var> referencedVars;
+  CollectVars collector(referencedVars);
+
+  for (auto expr : exprs) {
+    expr.accept(&collector);
+  }
+
+  return referencedVars;
+}
+
+void CallRewriter::visit(const CallStmt *op) {
+  if (!op->callee.getBody().defined() || !shouldInline(op)) {
+    stmt = op;
+    return;
+  }
+
+  stmt = Scope::make(op->callee.getBody());
+
+  // Replace callee parameters with arguments
+  iassert(op->actuals.size() == op->callee.getArguments().size());
+  for (size_t i = 0; i < op->actuals.size(); ++i) {
+    stmt = replaceVarByExpr(stmt, op->callee.getArguments()[i], op->actuals[i]);
+  }
+
+  IRBuilder builder;
+  static util::NameGenerator names;
+
+  const std::set<Var> referencedVars = getReferencedVars(op->actuals);
+
+  // Replace callee result variables with assignment targets
+  iassert(op->results.size() == op->callee.getResults().size());
+  for (size_t i = 0; i < op->results.size(); ++i) {
+    if (util::contains(referencedVars, op->results[i])) {
+      const auto resName = op->callee.getResults()[i].getName();
+      const auto tmpName = names.getName(INTERNAL_PREFIX("inline_" + resName));
+
+      Var tmpRes(tmpName, op->results[i].getType());
+      stmt = replaceVar(stmt, op->callee.getResults()[i], tmpRes);
+
+      Stmt tmpDecl = VarDecl::make(tmpRes);
+      Expr copyTmp = builder.unaryElwiseExpr(IRBuilder::Copy, tmpRes);
+      Stmt assignRes = AssignStmt::make(op->results[i], copyTmp);
+      stmt = Block::make({tmpDecl, stmt, assignRes});
+    } else {
+      stmt = replaceVar(stmt, op->callee.getResults()[i], op->results[i]);
+    }
+  }
+    
+  // Add comment
+  stmt = Comment::make(util::toString(*op), stmt, true, true);
+
+  // Add constants from inlined callee into environment
+  for (auto &c : op->callee.getEnvironment().getConstants()) {
+    env->addConstant(c.first, c.second);
+  }
+}
+
+Func inlineCalls(Func func) {
+  CallRewriter rewriter(&func.getStorage(), &func.getEnvironment());
+  Stmt body = rewriter.rewrite(func.getBody());
+
+  func = Func(func, body);
+  func = insertVarDecls(func);
+
+  return func;
+}
 
 Stmt inlineMapFunction(const Map *map, Var lv, vector<Var> ivs,
                        MapFunctionRewriter &rewriter, Storage* storage);
@@ -44,7 +185,7 @@ Stmt MapFunctionRewriter::inlineMapFunc(const Map *map, Var targetLoopVar,
   }
 
   this->targetSet = map->target;
-  this->neighborSet = map->neighbors;
+  this->neighborSets = map->neighbors;
   this->throughSet = map->through;
 
   iassert(kernel.getArguments().size() >= 1)
@@ -58,7 +199,8 @@ Stmt MapFunctionRewriter::inlineMapFunc(const Map *map, Var targetLoopVar,
     // Neighbors will be a tuple of elements, through args will be
     // two sets.
     auto maybeNeighbors = *argIt;
-    if (maybeNeighbors.getType().isTuple()) {
+    if (maybeNeighbors.getType().isUnnamedTuple() || 
+        maybeNeighbors.getType().isNamedTuple()) {
       this->neighbors = maybeNeighbors;
       argIt++;
     }
@@ -93,15 +235,33 @@ void MapFunctionRewriter::visit(const FieldWrite *op) {
     Expr setFieldRead = FieldRead::make(targetSet, op->fieldName);
     stmt = TensorWrite::make(setFieldRead, {targetLoopVar}, rewrite(op->value));
   }
-  // Write a field from a neighbor set
-  else if(isa<TupleRead>(op->elementOrSet) &&
-          isa<VarExpr>(to<TupleRead>(op->elementOrSet)->tuple) &&
-          to<VarExpr>(to<TupleRead>(op->elementOrSet)->tuple)->var==neighbors) {
-    expr = FieldRead::make(neighborSet, op->fieldName);
-    Expr setFieldRead = expr;
+  // Write a field from a (homogeneous) neighbor set
+  else if(isa<UnnamedTupleRead>(op->elementOrSet)) {
+    const auto tupleRead = to<UnnamedTupleRead>(op->elementOrSet);
+    if (isa<VarExpr>(tupleRead->tuple) && 
+        to<VarExpr>(tupleRead->tuple)->var == neighbors) {
+      Expr setFieldRead = FieldRead::make(neighborSets[0], op->fieldName);
+      Expr index = IRRewriter::rewrite(op->elementOrSet);
+      stmt = TensorWrite::make(setFieldRead, {index}, rewrite(op->value));
+    } else {
+      not_supported_yet;
+    }
+  }
+  // Write a field from a (heterogeneous) neighbor set
+  else if (isa<NamedTupleRead>(op->elementOrSet)) {
+    const auto tupleRead = to<NamedTupleRead>(op->elementOrSet);
+    if (isa<VarExpr>(tupleRead->tuple) && 
+        to<VarExpr>(tupleRead->tuple)->var == neighbors) {
+      const auto tupleType = tupleRead->tuple.type().toNamedTuple();
+      const auto neighborIdx = tupleType->elementIndex(tupleRead->elementName);
 
-    Expr index = IRRewriter::rewrite(op->elementOrSet);
-    stmt = TensorWrite::make(setFieldRead, {index}, rewrite(op->value));
+      Expr setFieldRead = FieldRead::make(neighborSets[neighborIdx], 
+                                          op->fieldName);
+      Expr index = IRRewriter::rewrite(op->elementOrSet);
+      stmt = TensorWrite::make(setFieldRead, {index}, rewrite(op->value));
+    } else {
+      not_supported_yet;
+    }
   }
   else {
     // TODO: Handle the case where the target var was reassigned
@@ -117,15 +277,33 @@ void MapFunctionRewriter::visit(const FieldRead *op) {
     Expr setFieldRead = FieldRead::make(targetSet, op->fieldName);
     expr = TensorRead::make(setFieldRead, {targetLoopVar});
   }
-  // Read a field from a neighbor set
-  else if(isa<TupleRead>(op->elementOrSet) &&
-          isa<VarExpr>(to<TupleRead>(op->elementOrSet)->tuple) &&
-          to<VarExpr>(to<TupleRead>(op->elementOrSet)->tuple)->var==neighbors) {
-    expr = FieldRead::make(neighborSet, op->fieldName);
-    Expr setFieldRead = expr;
+  // Read a field from a (homogeneous) neighbor set
+  else if(isa<UnnamedTupleRead>(op->elementOrSet)) {
+    const auto tupleRead = to<UnnamedTupleRead>(op->elementOrSet);
+    if (isa<VarExpr>(tupleRead->tuple) && 
+        to<VarExpr>(tupleRead->tuple)->var == neighbors) {
+      Expr setFieldRead = FieldRead::make(neighborSets[0], op->fieldName);
+      Expr index = IRRewriter::rewrite(op->elementOrSet);
+      expr = TensorRead::make(setFieldRead, {index});
+    } else {
+      not_supported_yet;
+    }
+  }
+  // Read a field from a (heterogeneous) neighbor set
+  else if (isa<NamedTupleRead>(op->elementOrSet)) {
+    const auto tupleRead = to<NamedTupleRead>(op->elementOrSet);
+    if (isa<VarExpr>(tupleRead->tuple) && 
+        to<VarExpr>(tupleRead->tuple)->var == neighbors) {
+      const auto tupleType = tupleRead->tuple.type().toNamedTuple();
+      const auto neighborIdx = tupleType->elementIndex(tupleRead->elementName);
 
-    Expr index = IRRewriter::rewrite(op->elementOrSet);
-    expr = TensorRead::make(setFieldRead, {index});
+      Expr setFieldRead = FieldRead::make(neighborSets[neighborIdx], 
+                                          op->fieldName);
+      Expr index = IRRewriter::rewrite(op->elementOrSet);
+      expr = TensorRead::make(setFieldRead, {index});
+    } else {
+      not_supported_yet;
+    }
   }
   // Read a field from a grid offset element
   else if (isa<SetRead>(op->elementOrSet) &&
@@ -156,17 +334,35 @@ void MapFunctionRewriter::visit(const FieldRead *op) {
   }
 }
 
-void MapFunctionRewriter::visit(const TupleRead *op) {
+void MapFunctionRewriter::visit(const UnnamedTupleRead *op) {
   iassert(isa<VarExpr>(op->tuple))
       << "This code assumes no expressions return a tuple";
 
   if (to<VarExpr>(op->tuple)->var == neighbors) {
-    const TupleType *tupleType = op->tuple.type().toTuple();
+    const UnnamedTupleType *tupleType = op->tuple.type().toUnnamedTuple();
     int cardinality = tupleType->size;
 
     Expr endpoints = IndexRead::make(targetSet, IndexRead::Endpoints);
     Expr indexExpr = Add::make(Mul::make(targetLoopVar, cardinality),
                                op->index);
+    expr = Load::make(endpoints, indexExpr);
+  }
+  else {
+    ierror << "Assumes tuples are only used for neighbor lists";
+  }
+}
+
+void MapFunctionRewriter::visit(const NamedTupleRead *op) {
+  iassert(isa<VarExpr>(op->tuple))
+      << "This code assumes no expressions return a tuple";
+
+  if (to<VarExpr>(op->tuple)->var == neighbors) {
+    const NamedTupleType *tupleType = op->tuple.type().toNamedTuple();
+    int cardinality = tupleType->elements.size();
+
+    Expr endpoints = IndexRead::make(targetSet, IndexRead::Endpoints);
+    Expr indexExpr = Add::make(Mul::make(targetLoopVar, cardinality),
+                               (int)tupleType->elementIndex(op->elementName));
     expr = Load::make(endpoints, indexExpr);
   }
   else {

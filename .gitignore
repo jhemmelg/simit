@@ -9,3 +9,6 @@ release
 *.ir.sim
 *.ir.ll
 *.ir.asm
+/.project
+/.settings/
+/.cproject

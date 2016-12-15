@@ -11,6 +11,7 @@
 #include "lower_string_ops.h"
 #include "lower_stencil_assemblies.h"
 
+#include "inline.h"
 #include "storage.h"
 #include "timers.h"
 #include "temps.h"
@@ -76,7 +77,9 @@ void printTimedCallGraph(string headerText, Func func, ostream* os) {
   stringstream ss;
   simit::ir::IRPrinterCallGraph(ss).print(func);
   TimerStorage::getInstance().addSourceLines(ss);
-  *os << ss.rdbuf();
+  if (os) {
+    *os << ss.rdbuf();
+  }
 }
 
 static inline
@@ -96,6 +99,10 @@ Func lower(Func func, std::ostream* os, bool time) {
     printCallGraph("Rewrite System Assigns (GPU)", func, os);
   }
 #endif
+
+  // Inline function calls
+  func = rewriteCallGraph(func, inlineCalls);
+  printCallGraph("Inline Fuction Calls", func, os);
 
   // Flatten index expressions and insert temporaries
   func = rewriteCallGraph(func, (Func(*)(Func))flattenIndexExpressions);
@@ -126,6 +133,7 @@ Func lower(Func func, std::ostream* os, bool time) {
   func = rewriteCallGraph(func, lowerPrints);
   printCallGraph("Lower String Operations and Prints", func, os);
 
+  // Lower field accesses
   func = rewriteCallGraph(func, lowerFieldAccesses);
   printCallGraph("Lower Field Accesses", func, os);
 
@@ -153,6 +161,7 @@ Func lower(Func func, std::ostream* os, bool time) {
   func = rewriteCallGraph(func, lowerTensorAccesses);
   printCallGraph("Lower Tensor Reads and Writes", func, os);
 
+  // Insert timers
   if (time) {
     printTimedCallGraph("Insert Timers", func, os);
     func = rewriteCallGraph(func, insertTimers);
